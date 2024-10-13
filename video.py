@@ -1,93 +1,144 @@
 import os
-import subprocess
-import glob
-import shutil
-import time
-import requests
+import asyncio
 import json
+import pyaudio
+import websockets
 from dotenv import load_dotenv
-from deepgram import DeepgramClient, PrerecordedOptions, FileSource
-
+import aiohttp
+import requests
+from flask import Flask, request, jsonify
+from threading import Thread
 load_dotenv()
 
-class VideoProcessor:
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 16000
+CHUNK = 16000
+
+class AudioProcessor:
     def __init__(self):
-        self.deepgram_client = DeepgramClient(os.getenv("DG_API_KEY"))
         self.grok_api_key = os.getenv("GROK_API_KEY")
+        self.dg_api_key = os.getenv("DG_API_KEY")
+        self.deepgram_url = f"wss://api.deepgram.com/v1/listen?punctuate=true&encoding=linear16&sample_rate={RATE}"
+        self.audio_queue = asyncio.Queue()
+        self.transcript_queue = asyncio.Queue()
+        self.keyword_queue = asyncio.Queue()
+        self.transcript_buffer = ""
+        self.min_chunk_size = 100  # Minimum number of characters before processing
+        self.BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+        self.flask_app = Flask(__name__)
+        self.setup_flask_routes()
 
-    def download_video(self, source, path, quality):
-        if not os.path.exists(path):
-            os.makedirs(path)
+    async def process_deepgram_stream(self, websocket):
+        async for message in websocket:
+            data = json.loads(message)
+            if data.get("is_final"):
+                transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
+                if transcript:
+                    await self.transcript_queue.put(transcript)
 
-        quality = quality.replace('p', '')
-        
-        if isinstance(source, str):  # It's a URL
-            video_title = subprocess.check_output(["yt-dlp", source, "--get-title"], universal_newlines=True).strip()
-            path = os.path.join(path, video_title)
-            if not os.path.exists(path):
-                os.mkdir(path)
-            else:
-                for file in os.listdir(path):
-                    file_path = os.path.join(path, file)
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
+    async def connect_to_deepgram(self):
+        async with websockets.connect(
+            self.deepgram_url,
+            extra_headers={"Authorization": f"Token {self.dg_api_key}"}
+        ) as websocket:
+            receive_task = asyncio.create_task(self.process_deepgram_stream(websocket))
+            send_task = asyncio.create_task(self.send_audio(websocket))
             
-            subprocess.run(["yt-dlp", source, "-P", path, "-S", f"res:{quality}", "--output", "%(title)s.%(ext)s"])
-            print("Video downloaded successfully!")
-            video_path = glob.glob(os.path.join(path, "*.*"))[0]
-        else:  # It's a local file path
-            video_title = os.path.splitext(os.path.basename(source))[0]
-            path = os.path.join(path, video_title)
-            if not os.path.exists(path):
-                os.mkdir(path)
-            video_path = os.path.join(path, os.path.basename(source))
-            shutil.copy(source, video_path)
-            print("Video copied successfully!")
+            print("Starting real-time capture and transcription...")
 
-        # Extract audio from the video
-        audio_path = os.path.join(path, f"{video_title}.mp3")
-        subprocess.run(["ffmpeg", "-i", video_path, "-q:a", "0", "-map", "a", audio_path])
-        print("Audio extracted successfully!")
+            try:
+                await asyncio.gather(receive_task, send_task)
+            except KeyboardInterrupt:
+                print("Stopping capture...")
+            finally:
+                receive_task.cancel()
+                send_task.cancel()
 
-        return video_path, audio_path, video_title
+    async def send_audio(self, websocket):
+        while True:
+            audio_data = await self.audio_queue.get()
+            await websocket.send(audio_data)
 
-    def transcribe_audio(self, audio_path):
-        print("Transcribing audio...")
-        
-        with open(audio_path, "rb") as file:
-            buffer_data = file.read()
+    def mic_callback(self, input_data, frame_count, time_info, status_flag):
+        self.audio_queue.put_nowait(input_data)
+        return (input_data, pyaudio.paContinue)
 
-        payload: FileSource = {
-            "buffer": buffer_data,
-        }
-
-        options = PrerecordedOptions(
-            model="nova-2",
-            smart_format=True
+    async def capture_audio(self):
+        audio = pyaudio.PyAudio()
+        stream = audio.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK,
+            stream_callback=self.mic_callback,
         )
 
-        tick = time.time()
-        response = self.deepgram_client.listen.prerecorded.v("1").transcribe_file(payload, options)
-        
-        print(f"Transcription completed in {time.time() - tick:.2f} seconds")
+        stream.start_stream()
 
-        word_timings = []
-        full_transcript = ''
-        
-        for word in response.results.channels[0].alternatives[0].words:
-            word_timings.append({
-                'start': word.start,
-                'end': word.end,
-                'word': word.word.strip().lower()
-            })
-            full_transcript += word.word + ' '
-        
-        full_transcript = full_transcript.strip()
-        
-        print("Audio transcribed successfully!")
-        return full_transcript, word_timings
+        try:
+            while stream.is_active():
+                await asyncio.sleep(0.1)
+        finally:
+            stream.stop_stream()
+            stream.close()
+            audio.terminate()
 
-    def create_chat_completion(self, messages):
+    async def process_transcripts(self):
+        while True:
+            transcript = await self.transcript_queue.get()
+            print(f"Transcript: {transcript}")
+            
+            self.transcript_buffer += transcript + " "
+            
+            if len(self.transcript_buffer) >= self.min_chunk_size:
+                keywords = await self.generate_keywords(self.transcript_buffer)
+                await self.keyword_queue.put(keywords)
+                print(f"Keywords: {keywords}")
+                
+                # Get tweets based on keywords
+                tweets = await self.get_stream_past(keywords)
+                
+                # Display transcript and tweets
+                print("\n--- Transcript and Related Tweets ---")
+                print(f"Transcript: {self.transcript_buffer}")
+                print("Related Tweets:")
+                for tweet in tweets:
+                    print(f"- {tweet['text']}")
+                print("-----------------------------------\n")
+                
+                # Send POST request to Flask server
+                await self.send_data_to_flask(self.transcript_buffer, tweets)
+                
+                self.transcript_buffer = ""  # Reset the buffer after processing
+
+    async def send_data_to_flask(self, transcript, tweets):
+        url = "http://localhost:5000/receive_data"
+        data = {
+            "transcript": transcript,
+            "tweets": [tweet['text'] for tweet in tweets]
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data) as response:
+                if response.status != 200:
+                    print(f"Failed to send data to Flask server: {await response.text()}")
+
+    def setup_flask_routes(self):
+        @self.flask_app.route('/receive_data', methods=['POST'])
+        def receive_data():
+            data = request.json
+            print("Received data in Flask server:")
+            print(f"Transcript: {data['transcript']}")
+            print("Tweets:")
+            for tweet in data['tweets']:
+                print(f"- {tweet}")
+            return jsonify({"status": "success"}), 200
+
+    def run_flask_server(self):
+        self.flask_app.run(host='0.0.0.0', port=5001)
+
+    async def create_chat_completion(self, messages):
         url = "https://api.x.ai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.grok_api_key}",
@@ -100,79 +151,68 @@ class VideoProcessor:
             "stream": True,
         }
 
-        with requests.post(url, headers=headers, json=data, stream=True) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if line:
-                    line = line.decode("utf-8")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=data) as response:
+                async for line in response.content:
+                    line = line.decode("utf-8").strip()
                     if line.startswith("data: "):
                         line = line[6:]
-                    if line.strip() == "[DONE]":
+                    if line == "[DONE]":
                         break
-                    chunk = json.loads(line)
-                    if "choices" in chunk and len(chunk["choices"]) > 0:
-                        delta = chunk["choices"][0]["delta"]
-                        if "content" in delta:
-                            yield delta["content"]
+                    try:
+                        chunk = json.loads(line)
+                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                            delta = chunk["choices"][0]["delta"]
+                            if "content" in delta:
+                                yield delta["content"]
+                    except json.JSONDecodeError:
+                        pass
 
-    def generate_keywords(self, transcript):
-        print("Generating keywords using Grok API...")
+    async def generate_keywords(self, transcript):
+        print(f"Generating keywords using Grok API for chunk of size {len(transcript)}...")
         
         conversation = [{"role": "system", "content": "You are an AI assistant that generates relevant keywords from a given transcript."}]
+        user_input = f"Generate 2-3 relevant keywords or key phrases from the following transcript. Provide only the keywords, separated by commas:\n\n{transcript}"
+        conversation.append({"role": "user", "content": user_input})
         
-        # Split the transcript into chunks of about 1000 characters
-        chunk_size = 1000
-        transcript_chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
+        full_response = ""
+        async for token in self.create_chat_completion(conversation):
+            full_response += token
         
-        all_keywords = []
-        
-        for chunk in transcript_chunks:
-            user_input = f"Generate 2-3 relevant keywords or key phrases from the following transcript chunk. Provide only the keywords, separated by commas:\n\n{chunk}"
-            conversation.append({"role": "user", "content": user_input})
-            
-            print("Grok-2: ", end="", flush=True)
-            full_response = ""
-            for token in self.create_chat_completion(conversation):
-                print(token, end="", flush=True)
-                full_response += token
-            print("\n")
-            
-            # Extract keywords from the response
-            keywords = [kw.strip() for kw in full_response.split(',')]
-            all_keywords.extend(keywords)
-            
-            # Remove the last user message to keep the conversation focused
-            conversation.pop()
-        
-        # Remove duplicates and join the keywords
-        unique_keywords = list(dict.fromkeys(all_keywords))
-        return ", ".join(unique_keywords)
+        # Extract keywords from the response
+        keywords = [kw.strip() for kw in full_response.split(',')]
+        return ", ".join(keywords)
 
-def main():
-    processor = VideoProcessor()
+    async def get_stream_past(self, keywords, limit=10):
+        query = " OR ".join(keywords.split(", "))
+        querystring = {"query": query, "max_results": str(limit)}
+        url = "https://api.twitter.com/2/tweets/search/recent"
+        headers = {
+            "Authorization": f"Bearer {self.BEARER_TOKEN}"
+        }
 
-    # Example usage
-    # video_path = "./downloads"
-    # youtube_url = input("Enter YouTube video URL: ")
-    # video_quality = input("Enter video quality (e.g., 720p, 1080p): ")
-    # video_path, audio_path, video_title = processor.download_video(youtube_url, video_path, video_quality)
-    audio_path = "/Users/parassavnani/Desktop/dev/xAI_hackathon/downloads/Vijeta Choudhary - 🇺🇸 BREAKING: Elon Musk's interview with Donald Trump becomes the biggest Space in X(Twitter )history with over 1.3 million+ listeners tuning in. #Trump2024/Vijeta Choudhary - 🇺🇸 BREAKING: Elon Musk's interview with Donald Trump becomes the biggest Space in X(Twitter )history with over 1.3 million+ listeners tuning in. #Trump2024.mp3"
-    transcript, word_timings = processor.transcribe_audio(audio_path)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=querystring) as response:
+                if response.status != 200:
+                    raise Exception(f"Cannot get stream (HTTP {response.status}): {await response.text()}")
+                data = await response.json()
+                return data.get('data', [])
 
-    print(f"Transcript: {transcript}...")  # Print first 100 characters of transcript
-    print(f"Number of words: {len(word_timings)}")
+    async def run(self):
+        # Start Flask server in a separate thread
+        flask_thread = Thread(target=self.run_flask_server)
+        flask_thread.start()
 
-    # Save transcript to a file
-    with open("transcript.txt", "w") as f:
-        f.write(transcript)
+        tasks = [
+            self.capture_audio(),
+            self.connect_to_deepgram(),
+            self.process_transcripts()
+        ]
+        await asyncio.gather(*tasks)
 
-    # Read transcript from file and generate keywords
-    with open("transcript.txt", "r") as f:
-        file_transcript = f.read()
-    
-    keywords = processor.generate_keywords(file_transcript)
-    if keywords:
-        print(f"Generated keywords: {keywords}")
+async def main():
+    processor = AudioProcessor()
+    await processor.run()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

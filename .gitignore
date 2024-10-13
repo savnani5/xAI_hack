@@ -1,3 +1,4 @@
 .env
 transcript.txt
 /downloads
+__pycache__/
