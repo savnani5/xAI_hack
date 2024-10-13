@@ -8,6 +8,8 @@ import aiohttp
 import requests
 from flask import Flask, request, jsonify
 from threading import Thread
+from collections import deque
+from flask_cors import CORS  # Add this import
 load_dotenv()
 
 FORMAT = pyaudio.paInt16
@@ -27,6 +29,8 @@ class AudioProcessor:
         self.min_chunk_size = 100  # Minimum number of characters before processing
         self.BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
         self.flask_app = Flask(__name__)
+        CORS(self.flask_app)  # Enable CORS for all routes
+        self.data_queue = deque(maxlen=10)  # Store last 10 data points
         self.setup_flask_routes()
 
     async def process_deepgram_stream(self, websocket):
@@ -114,29 +118,21 @@ class AudioProcessor:
                 self.transcript_buffer = ""  # Reset the buffer after processing
 
     async def send_data_to_flask(self, transcript, tweets):
-        url = "http://localhost:5000/receive_data"
-        data = {
+        self.data_queue.append({
             "transcript": transcript,
-            "tweets": [tweet['text'] for tweet in tweets]
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=data) as response:
-                if response.status != 200:
-                    print(f"Failed to send data to Flask server: {await response.text()}")
+            "tweets": [{"id": tweet['id'], "text": tweet['text']} for tweet in tweets]
+        })
 
     def setup_flask_routes(self):
-        @self.flask_app.route('/receive_data', methods=['POST'])
-        def receive_data():
-            data = request.json
-            print("Received data in Flask server:")
-            print(f"Transcript: {data['transcript']}")
-            print("Tweets:")
-            for tweet in data['tweets']:
-                print(f"- {tweet}")
-            return jsonify({"status": "success"}), 200
+        @self.flask_app.route('/get_data', methods=['GET'])
+        def get_data():
+            if self.data_queue:
+                return jsonify(self.data_queue[-1]), 200
+            else:
+                return jsonify({"transcript": "", "tweets": []}), 200
 
     def run_flask_server(self):
-        self.flask_app.run(host='0.0.0.0', port=5001)
+        self.flask_app.run(host='127.0.0.1', port=5001)
 
     async def create_chat_completion(self, messages):
         url = "https://api.x.ai/v1/chat/completions"
