@@ -9,9 +9,9 @@ This project creates a dynamic knowledge graph by processing real-time tweets fr
 ## 🚀 Features
 
 - Real-time tweet processing from X video stream
+- Live transcription from deepgram
 - Dynamic knowledge graph visualization
 - Topic clustering and relationship mapping
-- Interactive graph exploration
 - Sentiment analysis integration
 - Real-time data updates
 
